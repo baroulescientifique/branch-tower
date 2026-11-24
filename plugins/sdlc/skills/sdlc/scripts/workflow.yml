@@ -1,0 +1,47 @@
+schema_version: "1.0"
+workflow:
+  id: sdlc
+  name: Spec-driven development
+  version: "1.0.0"
+  description: Review a specification before running implementation and independent verification.
+
+requires:
+  speckit_version: "==1.4.4"
+
+inputs:
+  run_dir:
+    type: string
+    required: true
+  review:
+    type: string
+    default: ""
+
+steps:
+  - id: plan
+    type: shell
+    strict: true
+    env:
+      SDLC_RUN_DIR: "{{ inputs.run_dir }}"
+    run: 'python3 "$SPECKIT_WORKFLOW_DIR/run.py" _phase prepare'
+    output_format: json
+    timeout: 1500
+
+  - id: approval
+    type: gate
+    message: "Review the files in {{ steps.plan.output.data.review_dir }} before implementation."
+    options: [approve, reject]
+    on_reject: abort
+    verdict_input: review
+
+  - id: implement-and-verify
+    type: shell
+    strict: true
+    env:
+      SDLC_RUN_DIR: "{{ inputs.run_dir }}"
+    run: 'python3 "$SPECKIT_WORKFLOW_DIR/run.py" _phase execute'
+    output_format: json
+    timeout: 14400
+
+outputs:
+  candidate:
+    value: "{{ steps.implement-and-verify.output.data }}"

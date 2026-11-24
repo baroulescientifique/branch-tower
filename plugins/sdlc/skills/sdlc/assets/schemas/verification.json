@@ -1,0 +1,16 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["criteria"],
+  "properties": {
+    "criteria": {"type": "array", "items": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "status", "check", "observed"],
+      "properties": {
+        "id": {"type": "string"},
+        "status": {"type": "string", "enum": ["pass", "fail", "blocked"]},
+        "check": {"type": "string"}, "observed": {"type": "string"}
+      }
+    }}
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "name": "sdlc",
+  "version": "0.1.0",
+  "description": "Plan, approve, implement, and independently verify changes in a Git repository.",
+  "author": {
+    "name": "SDLC Tools"
+  }
+}

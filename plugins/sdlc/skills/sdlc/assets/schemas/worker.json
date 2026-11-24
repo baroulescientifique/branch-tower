@@ -1,0 +1,9 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["checks", "summary"],
+  "properties": {
+    "checks": {"type": "array", "items": {"type": "string"}},
+    "summary": {"type": "string"}
+  }
+}

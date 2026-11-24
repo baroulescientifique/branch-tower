@@ -1,0 +1,9 @@
+{
+  "name": "sdlc-tools",
+  "owner": {"name": "SDLC Tools"},
+  "description": "Spec-driven development and independent verification.",
+  "plugins": [{
+    "name": "sdlc",
+    "source": "./plugins/sdlc"
+  }]
+}
