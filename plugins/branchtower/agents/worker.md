@@ -1,6 +1,6 @@
 ---
 name: worker
-description: Implement an approved SDLC task in the runner-provided checkout.
+description: Implement an approved BranchTower task in the runner-provided checkout.
 tools: Read, Glob, Grep, Edit, Write, Bash
 ---
 

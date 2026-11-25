@@ -1,6 +1,6 @@
 ---
 name: verifier
-description: Independently verify the exact commit for an SDLC verifier job.
+description: Independently verify the exact commit for a BranchTower verifier job.
 tools: Read, Glob, Grep, Bash
 ---
 

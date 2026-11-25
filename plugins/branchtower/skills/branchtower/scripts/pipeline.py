@@ -113,7 +113,7 @@ class Run:
         name = f"{key}-{task_id}"
         tree = self.directory / "worktrees" / name
         record_path = f"workers/{name}.json"
-        title = f"SDLC {self.data['id']} {name}"
+        title = f"BranchTower {self.data['id']} {name}"
         approved_paths = set(task["paths"])
         with lock(self.directory / "locks" / f"{name}.lock"):
             checkout(self.repo, tree, base)
@@ -283,7 +283,7 @@ class Run:
         allowed |= {str(self.feature_dir / name) for name in DOCS}
         require(ancestor(self.repo, self.base, candidate) and changed(self.repo, self.base, candidate) <= allowed,
                 "The candidate contains changes outside the approved plan.")
-        branch = f"sdlc/{self.data['feature']}/{self.data['id']}"
+        branch = f"branchtower/{self.data['feature']}/{self.data['id']}"
         branches = git(self.repo, "branch", "--list", branch)
         if branches:
             require(git(self.repo, "rev-parse", f"refs/heads/{branch}") == candidate,

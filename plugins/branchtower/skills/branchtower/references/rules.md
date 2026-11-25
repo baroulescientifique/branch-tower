@@ -1,4 +1,4 @@
-# Shared SDLC rules
+# Shared BranchTower rules
 
 - Keep each change traceable from a user outcome to a stable acceptance ID, owning task, and verification evidence.
 - Review the spec, plan, and task assignments at a named starting commit before implementation begins.

@@ -1,9 +1,9 @@
 {
-  "name": "sdlc-tools",
-  "interface": {"displayName": "SDLC Tools"},
+  "name": "branchtower-tools",
+  "interface": {"displayName": "BranchTower Tools"},
   "plugins": [{
-    "name": "sdlc",
-    "source": {"source": "local", "path": "./plugins/sdlc"},
+    "name": "branchtower",
+    "source": {"source": "local", "path": "./plugins/branchtower"},
     "policy": {"installation": "AVAILABLE", "authentication": "ON_INSTALL"},
     "category": "Developer Tools"
   }]

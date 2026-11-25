@@ -1,8 +1,8 @@
 {
-  "name": "sdlc",
-  "version": "0.2.0",
+  "name": "branchtower",
+  "version": "0.3.0",
   "description": "Plan, approve, implement, and independently verify changes in a Git repository.",
   "author": {
-    "name": "SDLC Tools"
+    "name": "BranchTower Tools"
   }
 }

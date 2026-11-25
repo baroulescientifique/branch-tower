@@ -18,13 +18,20 @@ from plan import digest, text
 SKILL = Path(__file__).resolve().parents[1]
 
 
-def paths(repo):
-    default = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state")) / "sdlc"
-    store = Path(os.environ.get("SDLC_STATE_DIR", default)).expanduser().resolve()
+def paths(repo, run_id=None):
+    state = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state"))
+    configured = os.environ.get("BRANCHTOWER_STATE_DIR") or os.environ.get("SDLC_STATE_DIR")
+    store = Path(configured) if configured else state / "branchtower"
     common = git_dir(repo)
+    relative = Path(digest(str(common))) / "runs"
+    if run_id and not configured and not (store / relative / run_id).exists():
+        previous = state / "sdlc"
+        if (previous / relative / run_id / "run.json").is_file():
+            store = previous
+    store = store.expanduser().resolve()
     require(not store.is_relative_to(repo) and not store.is_relative_to(common),
-            "Place SDLC_STATE_DIR outside the app and its Git metadata.")
-    return store / digest(str(common)) / "runs", common
+            "Place BRANCHTOWER_STATE_DIR outside the app and its Git metadata.")
+    return store / relative, common
 
 
 def new_run(repo, feature, request, host, max_fixes, backend="cli", package=SKILL):
@@ -49,7 +56,7 @@ def new_run(repo, feature, request, host, max_fixes, backend="cli", package=SKIL
 
 def load(repo, run_id):
     require(re.fullmatch(r"[0-9a-f]{16}", run_id), "Invalid run ID.")
-    storage, common = paths(repo)
+    storage, common = paths(repo, run_id)
     directory = storage / run_id
     require((directory / "run.json").is_file() and not directory.is_symlink(), "Run not found for this repo.")
     run = Run(directory)
@@ -182,7 +189,9 @@ def execute(repo, args):
         run = load(repo, args.run_id)
         pinned = run.skill / "scripts" / "run.py"
         if run.native and Path(__file__).resolve() != pinned:
-            os.execv(sys.executable, [sys.executable, str(pinned), *sys.argv[1:]])
+            # Earlier pinned runners read only the original state directory setting.
+            env = dict(os.environ, SDLC_STATE_DIR=str(run.directory.parents[2]))
+            os.execve(sys.executable, [sys.executable, str(pinned), *sys.argv[1:]], env)
     if subcommand == "status":
         return summary(run)
 
@@ -239,7 +248,7 @@ def execute(repo, args):
 
 
 def parser():
-    result = argparse.ArgumentParser(description="Run the SDLC plugin in an application Git repository.")
+    result = argparse.ArgumentParser(description="Run BranchTower in an application Git repository.")
     result.add_argument("--repo", type=Path, default=Path.cwd())
     commands = result.add_subparsers(dest="command", required=True)
     start = commands.add_parser("start")
@@ -298,8 +307,8 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except (Error, OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired) as error:
-        print(f"sdlc: {error}", file=sys.stderr)
+        print(f"branchtower: {error}", file=sys.stderr)
         sys.exit(1)
     except KeyboardInterrupt:
-        print("sdlc: Interrupted. Use status to inspect the run.", file=sys.stderr)
+        print("branchtower: Interrupted. Use status to inspect the run.", file=sys.stderr)
         sys.exit(130)

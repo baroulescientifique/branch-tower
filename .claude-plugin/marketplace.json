@@ -1,9 +1,9 @@
 {
-  "name": "sdlc-tools",
-  "owner": {"name": "SDLC Tools"},
+  "name": "branchtower-tools",
+  "owner": {"name": "BranchTower Tools"},
   "description": "Spec-driven development and independent verification.",
   "plugins": [{
-    "name": "sdlc",
-    "source": "./plugins/sdlc"
+    "name": "branchtower",
+    "source": "./plugins/branchtower"
   }]
 }

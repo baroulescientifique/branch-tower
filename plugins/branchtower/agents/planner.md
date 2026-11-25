@@ -1,6 +1,6 @@
 ---
 name: planner
-description: Draft an SDLC feature plan from a runner-provided planner job.
+description: Draft a BranchTower feature plan from a runner-provided planner job.
 tools: Read, Glob, Grep
 ---
 

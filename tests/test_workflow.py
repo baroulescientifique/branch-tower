@@ -9,7 +9,7 @@ from tempfile import TemporaryDirectory
 import unittest
 
 REPO = Path(__file__).resolve().parents[1]
-RUNNER = REPO / "plugins/sdlc/skills/sdlc/scripts/run.py"
+RUNNER = REPO / "plugins/branchtower/skills/branchtower/scripts/run.py"
 sys.path.insert(0, str(RUNNER.parent))
 from pipeline import Run
 from handoff import publish
@@ -44,10 +44,10 @@ class Fixture:
         return self.invoke("approve", start["run_id"], "--digest", start["draft_digest"], **kwargs)
 
     def directory(self, data):
-        return next(Path(self.env["SDLC_STATE_DIR"]).glob(f"*/runs/{data['run_id']}"))
+        return next(Path(self.env["BRANCHTOWER_STATE_DIR"]).glob(f"*/runs/{data['run_id']}"))
 
     def branch(self, data):
-        return f"sdlc/report/{data['run_id']}"
+        return f"branchtower/report/{data['run_id']}"
 
 
 class WorkflowTest(unittest.TestCase):
@@ -65,7 +65,7 @@ class WorkflowTest(unittest.TestCase):
             path = binary / executable
             shutil.copyfile(REPO / "tests/fake_cli.py", path)
             path.chmod(0o755)
-        env = {**os.environ, "PATH": f"{binary}:{os.environ['PATH']}", "SDLC_STATE_DIR": str(parent / "state"),
+        env = {**os.environ, "PATH": f"{binary}:{os.environ['PATH']}", "BRANCHTOWER_STATE_DIR": str(parent / "state"),
                "SDLC_TEST_MARKERS": str(markers), "SPECIFY_INIT_DIR": str(root), "CLAUDECODE": "outer"}
         self.fixture = Fixture(root, env)
         self.fixture.git("init", "-q", "-b", "main")
@@ -95,6 +95,21 @@ class WorkflowTest(unittest.TestCase):
         return f.invoke("submit-job", data["run_id"], "--job", job["id"], "--token", job["token"],
                         "--agent-id", job["agent_id"], "--result-file", str(path), expect=expect)
 
+    def test_default_state_location_and_lookup_of_older_runs(self):
+        f = self.fixture
+        state = f.root.parent / "xdg-state"
+        f.env.pop("BRANCHTOWER_STATE_DIR")
+        f.env.pop("SDLC_STATE_DIR", None)
+        f.env["XDG_STATE_HOME"] = str(state)
+        current = self.native_start()
+        self.assertTrue(list((state / "branchtower").glob(f"*/runs/{current['run_id']}/run.json")))
+
+        f.env["SDLC_STATE_DIR"] = str(state / "sdlc")
+        previous = self.native_start()
+        del f.env["SDLC_STATE_DIR"]
+        restored = f.invoke("status", previous["run_id"])
+        self.assertEqual(restored["jobs"], previous["jobs"])
+
     def test_native_jobs_finish_and_repair_without_running_a_background_cli(self):
         f = self.fixture
         started = self.native_start(host="claude")
@@ -108,7 +123,7 @@ class WorkflowTest(unittest.TestCase):
         review = f.invoke("resume", run_id)
         self.assertEqual(review["status"], "paused")
         self.assertEqual(review["jobs"], [])
-        self.assertFalse(f.git("branch", "--list", "sdlc/*"))
+        self.assertFalse(f.git("branch", "--list", "branchtower/*"))
         ready = f.approve(review)
         self.assertEqual([job["id"] for job in ready["jobs"]], ["initial-1-T01", "initial-1-T02"])
         first = self.native_attach(run_id, "initial-1-T01", "native-a")
@@ -200,7 +215,7 @@ class WorkflowTest(unittest.TestCase):
         (tree / "a.txt").write_text("3\n")
         failed = f.invoke("resume", run_id, expect=1)
         self.assertIn("changed after its agent submitted", failed["detail"])
-        self.assertFalse(f.git("branch", "--list", "sdlc/*"))
+        self.assertFalse(f.git("branch", "--list", "branchtower/*"))
         second = self.native_attach(run_id, "initial-1-T02", "independent-worker")
         (Path(second["checkout"]) / "b.txt").write_text("3\n")
         submitted = self.native_submit(started, second, result)
@@ -218,18 +233,18 @@ class WorkflowTest(unittest.TestCase):
         tree = Path(job["checkout"])
         (tree / "a.txt").write_text("2\n")
         subprocess.run(["git", "add", "a.txt"], cwd=tree, check=True)
-        subprocess.run(["git", "commit", "-qm", f"SDLC {run_id} {job['id']}", "-m",
+        subprocess.run(["git", "commit", "-qm", f"BranchTower {run_id} {job['id']}", "-m",
                         json.dumps({"summary": "Predates submission", "checks": ["Read a.txt"]})],
                        cwd=tree, check=True)
         failed = f.invoke("resume", run_id, expect=1)
         self.assertIn("committed without an accepted native result", failed["detail"])
-        self.assertFalse(f.git("branch", "--list", "sdlc/*"))
+        self.assertFalse(f.git("branch", "--list", "branchtower/*"))
 
     def test_codex_approval_parallel_dependencies_verification_and_release(self):
         f = self.fixture
         start = f.start()
         self.assertEqual(start["status"], "paused")
-        self.assertEqual(f.git("branch", "--list", "sdlc/*"), "")
+        self.assertEqual(f.git("branch", "--list", "branchtower/*"), "")
         self.assertEqual(f.git("status", "--porcelain"), "")
         self.assertIn("T03", (Path(start["review_dir"]) / "tasks.md").read_text())
         denied = f.invoke("approve", start["run_id"], "--digest", "invalid", expect=1)
