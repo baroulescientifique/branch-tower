@@ -11,6 +11,7 @@ import uuid
 from common import Error, encode, git, git_dir, head, lock, read_json, require, root, write
 import engine
 from handoff import passing_report, publish, release
+from native import advance, result_input
 from pipeline import Run
 from plan import digest, text
 
@@ -26,7 +27,7 @@ def paths(repo):
     return store / digest(str(common)) / "runs", common
 
 
-def new_run(repo, feature, request, host, max_fixes, package=SKILL):
+def new_run(repo, feature, request, host, max_fixes, backend="cli", package=SKILL):
     require(re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", feature) and len(feature) <= 60,
             "Use a lowercase feature ID up to 60 characters, such as json-output.")
     require(text(request), "A feature request is required.")
@@ -41,7 +42,7 @@ def new_run(repo, feature, request, host, max_fixes, package=SKILL):
     shutil.copytree(package, directory / "skill", ignore=shutil.ignore_patterns("__pycache__"))
     write(directory / "run.json", encode({
         "id": run_id, "feature": feature, "request": request, "host": host, "max_fixes": max_fixes,
-        "repo": str(repo), "git_dir": str(common), "base": base, "protocol": 1,
+        "repo": str(repo), "git_dir": str(common), "base": base, "protocol": 1, "backend": backend,
     }))
     return Run(directory)
 
@@ -71,6 +72,10 @@ def summary(run, output=None):
             result["status"] = current["status"]
         result["engine_status"] = current["status"]
         result["engine_run_id"] = current["id"]
+    if run.native:
+        progress = run.native.progress()
+        result = {**progress, **(output or {})}
+        result["jobs"] = [run.native.describe(run.native.read(job_id)) for job_id in progress["jobs"]]
     if not result:
         result["status"] = "created"
     if (run.directory / "rejected.json").exists():
@@ -82,7 +87,7 @@ def summary(run, output=None):
         })
     handoff_exists = (run.directory / "handoff.json").is_file()
     if result["status"] == "completed":
-        require(handoff_exists, "Spec Kit completed without a verified handoff.")
+        require(handoff_exists, "The workflow completed without a verified handoff.")
     if handoff_exists:
         handoff = run.read("handoff.json")
         result.update(handoff)
@@ -97,7 +102,9 @@ def summary(run, output=None):
         result["latest_evidence"] = str(run.directory / run.read("latest-verification.json")["report"])
     if (run.directory / "superseded.json").is_file():
         result["superseded_by"] = run.read("superseded.json")["run"]
-    return {**result, "run_id": run.data["id"], "feature": run.data["feature"], "host": run.data["host"]}
+    return {**result, **(output or {}), "run_id": run.data["id"], "feature": run.data["feature"],
+            "host": run.data["host"],
+            "backend": run.data.get("backend", "cli")}
 
 
 def phase(name):
@@ -112,18 +119,86 @@ def phase(name):
             raise
 
 
+def native_command(run, args):
+    action = args.command
+    jobs = run.native
+    progress = jobs.progress()
+    if action == "verify-commit":
+        require(progress["status"] == "completed" and not progress["jobs"],
+                "Finish the current native workflow before asking for a separate commit check.")
+        run.approved(check_current=False)
+        require(re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", args.commit), "Use the full commit ID.")
+        candidate = git(run.repo, "rev-parse", "--verify", f"{args.commit}^{{commit}}")
+        return summary(run, advance(run, candidate))
+    if action == "resume":
+        if progress["status"] == "completed":
+            return summary(run)
+        return summary(run, advance(run, progress.get("candidate")))
+    if action == "approve":
+        require(progress["status"] == "paused", "Approval requires a paused review.")
+        run.approve(args.digest)
+        return summary(run, advance(run))
+    if action == "reject":
+        require(progress["status"] == "paused" and not (run.directory / "approval.json").exists(),
+                "Rejection requires a pending review.")
+        run.save("rejected.json", {"run": run.data["id"]})
+        return summary(run)
+    if action in {"reserve-job", "attach-agent", "submit-job", "detach-agent"}:
+        if action != "detach-agent" and jobs.read(args.job)["role"] != "planner":
+            run.approved(check_current=not progress.get("candidate"))
+        if action == "reserve-job":
+            job = jobs.reserve(args.job)
+        elif action == "attach-agent":
+            job = jobs.attach(args.job, args.token, args.agent_id)
+        elif action == "submit-job":
+            job = jobs.submit(args.job, args.token, args.agent_id, result_input(args.result_file))
+        else:
+            job = jobs.detach(args.job, args.token)
+        return {**summary(run), "job": job}
+    require(False, "Use resume to continue a native run.")
+
+
+def revise(run, request):
+    if run.native:
+        reserved = [run.native.read(job_id) for job_id in run.native.progress()["jobs"]]
+        require(not any(job["token"] and job["result"] is None for job in reserved),
+                "Stop and detach outstanding native agents before revising the run.")
+    replacement = new_run(run.repo, run.data["feature"], request, run.data["host"],
+                          run.data["max_fixes"], run.data.get("backend", "cli"))
+    run.save("superseded.json", {"run": replacement.data["id"]})
+    with lock(replacement.directory / "locks" / "engine.lock") as replacement_fd:
+        if replacement.native:
+            return summary(replacement, advance(replacement))
+        return summary(replacement, engine.launch(replacement, new=True, lock_fd=replacement_fd))
+
+
 def execute(repo, args):
     subcommand = args.command
     if subcommand == "release":
         return release(repo, args)
     if subcommand == "start":
-        run = new_run(repo, args.feature, args.request, args.host, args.max_fixes)
+        run = new_run(repo, args.feature, args.request, args.host, args.max_fixes, args.backend)
     else:
         run = load(repo, args.run_id)
+        pinned = run.skill / "scripts" / "run.py"
+        if run.native and Path(__file__).resolve() != pinned:
+            os.execv(sys.executable, [sys.executable, str(pinned), *sys.argv[1:]])
     if subcommand == "status":
         return summary(run)
 
     with lock(run.directory / "locks" / "engine.lock") as lock_fd:
+        if run.native:
+            require(not (run.directory / "superseded.json").exists(), "This run was superseded.")
+            if subcommand == "revise":
+                return revise(run, args.request)
+            if subcommand == "start":
+                return summary(run, advance(run))
+            require(not (run.directory / "rejected.json").exists(), "This run was rejected. Revise it to start again.")
+            if subcommand == "open-pr":
+                return publish(run, args.remote, args.base)
+            return native_command(run, args)
+        require(subcommand not in {"reserve-job", "attach-agent", "submit-job", "detach-agent"},
+                "Agent jobs are available in native runs.")
         if subcommand == "verify-commit":
             draft = run.approved(check_current=False)
             require(re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", args.commit), "Use the full commit ID.")
@@ -138,10 +213,7 @@ def execute(repo, args):
         with lock(run.directory / "locks" / "phase.lock"):
             pass
         if subcommand == "revise":
-            replacement = new_run(repo, run.data["feature"], args.request, run.data["host"], run.data["max_fixes"])
-            run.save("superseded.json", {"run": replacement.data["id"]})
-            with lock(replacement.directory / "locks" / "engine.lock") as replacement_fd:
-                return summary(replacement, engine.launch(replacement, new=True, lock_fd=replacement_fd))
+            return revise(run, args.request)
         if subcommand == "start":
             return summary(run, engine.launch(run, new=True, lock_fd=lock_fd))
         require(not (run.directory / "rejected.json").exists(), "This run was rejected. Revise it to start again.")
@@ -175,6 +247,7 @@ def parser():
     start.add_argument("--request", required=True)
     start.add_argument("--host", choices=("codex", "claude"), required=True)
     start.add_argument("--max-fixes", type=int, default=2)
+    start.add_argument("--backend", choices=("native", "cli"), default="cli")
     for name in ("status", "approve", "reject", "resume", "recover", "revise", "open-pr", "verify-commit"):
         sub = commands.add_parser(name)
         sub.add_argument("run_id")
@@ -187,6 +260,16 @@ def parser():
             sub.add_argument("--base")
         if name == "verify-commit":
             sub.add_argument("--commit", required=True)
+    for name in ("reserve-job", "attach-agent", "submit-job", "detach-agent"):
+        job = commands.add_parser(name)
+        job.add_argument("run_id")
+        job.add_argument("--job", required=True)
+        if name != "reserve-job":
+            job.add_argument("--token", required=True)
+        if name in {"attach-agent", "submit-job"}:
+            job.add_argument("--agent-id", required=True)
+        if name == "submit-job":
+            job.add_argument("--result-file", required=True)
     deploy = commands.add_parser("release")
     for key in ("evidence", "commit", "artifact", "owner", "smoke-check", "rollback", "out"):
         deploy.add_argument(f"--{key}", required=True)
@@ -202,6 +285,8 @@ def main():
         args = parser().parse_args()
         result = execute(root(args.repo), args)
     print(encode(result), end="")
+    if "job" in result:
+        return 0
     if result.get("status") in {"startup_failed", "failed"} or (
         "criteria" in result and any(row["status"] != "pass" for row in result["criteria"])
     ):

@@ -8,6 +8,7 @@ from adapters import claude, codex, validate
 from common import ancestor, changed, checkout, commit, encode, git, head, lock, read_json
 from common import git_output, require, status, write
 from handoff import markdown
+from native import Jobs, Pending, validate_verdict
 from plan import DOCS, batches, digest, render, text, validate as validate_plan
 
 
@@ -26,6 +27,7 @@ class Run:
         self.candidate = self.directory / "worktrees" / "candidate"
         self.templates = self.skill / "assets" / "templates"
         self.host = {"codex": codex, "claude": claude}[self.data["host"]]
+        self.native = Jobs(self) if self.data.get("backend") == "native" else None
 
     def read(self, name):
         return read_json(self.directory / name)
@@ -33,7 +35,7 @@ class Run:
     def save(self, name, value):
         write(self.directory / name, encode(value))
 
-    def agent(self, role, cwd, context, schema):
+    def agent(self, role, cwd, context, schema, job_id=None, *, paths=(), criteria=()):
         references = self.skill / "references"
         instructions = [
             (references / f"{name}.md").read_text(encoding="utf-8")
@@ -41,6 +43,8 @@ class Run:
         ]
         prompt = "\n\n".join([*instructions, *context])
         schema_path = self.skill / "assets" / "schemas" / f"{schema}.json"
+        if self.native:
+            return self.native.request(job_id, role, cwd, prompt, schema_path, paths=paths, criteria=criteria)
         result = self.host.invoke(
             cwd, role, prompt, schema_path, (self.repo, self.git_dir, self.skill), self.scratch,
             fds=(self.phase_fd,) if hasattr(self, "phase_fd") else (),
@@ -63,7 +67,7 @@ class Run:
             require(head(self.review_tree) == self.base and not status(self.review_tree),
                     "The planner needs a clean checkout of the starting commit.")
             value = self.agent(
-                "planner", self.review_tree, ["Feature request\n" + self.data["request"]], "plan",
+                "planner", self.review_tree, ["Feature request\n" + self.data["request"]], "plan", "planner",
             )
             require(head(self.review_tree) == self.base and not status(self.review_tree),
                     "The planner changed its checkout.")
@@ -125,7 +129,7 @@ class Run:
                     "Approved plan\n" + draft["files"]["plan.md"],
                     "Verifier feedback for this repair\n" + encode(feedback) if feedback else
                     "Implement the assigned task.",
-                ], "worker")
+                ], "worker", name, paths=task["paths"])
                 require(text(result["summary"]) and result["checks"]
                         and all(text(check) for check in result["checks"]),
                         f"{task_id} returned an incomplete handoff.")
@@ -136,6 +140,10 @@ class Run:
                 require(paths or feedback, f"{task_id} produced no implementation changes.")
                 if paths:
                     git(tree, "add", "-A", "--", *sorted(paths))
+                if self.native:
+                    require(git(tree, "write-tree") == self.native.read(name)["tree"],
+                            f"{task_id} changed after its agent submitted the result.")
+                if paths:
                     current = commit(tree, title, encode(result))
                 else:
                     self.save(record_path, {"task": task_id, "base": base, "commit": base,
@@ -147,6 +155,12 @@ class Run:
                 files = changed(tree, base, current)
                 require(files and files <= approved_paths, f"{task_id} committed unapproved files.")
                 result = json.loads(git(tree, "show", "-s", "--format=%b", current))
+                if self.native:
+                    job = self.native.read(name)
+                    require(job["result"] is not None,
+                            f"{task_id} committed without an accepted native result.")
+                    require(result == job["result"] and git(tree, "rev-parse", f"{current}^{{tree}}") == job["tree"],
+                            f"{task_id} committed a different result than the native handoff.")
                 self.save(record_path, {"task": task_id, "base": base, "commit": current,
                                         "files": sorted(files), "report": result})
             require(not status(tree), f"{task_id} left a dirty checkout.")
@@ -166,10 +180,23 @@ class Run:
             return record["result"]
         require(ancestor(self.candidate, record["base"], head(self.candidate)),
                 "The integration checkout changed its starting point.")
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            futures = [pool.submit(self.worker, task, key, record["base"], draft, feedback)
-                       for task in tasks]
-            receipts = [future.result() for future in futures]
+        if self.native:
+            receipts = []
+            waiting = []
+            for task in tasks:
+                try:
+                    receipts.append(self.worker(task, key, record["base"], draft, feedback))
+                except Pending as pending:
+                    waiting.extend(pending.jobs)
+                    if len(waiting) == 2:
+                        break
+            if waiting:
+                raise Pending(waiting)
+        else:
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                futures = [pool.submit(self.worker, task, key, record["base"], draft, feedback)
+                           for task in tasks]
+                receipts = [future.result() for future in futures]
         require(any(row["files"] for row in receipts), "No approved worker could correct the failure.")
         for receipt in receipts:
             if not ancestor(self.candidate, receipt["commit"], head(self.candidate)):
@@ -212,26 +239,33 @@ class Run:
             actual = git_output(self.repo, "show", f"{candidate}:{self.feature_dir.as_posix()}/{name}")
             require(actual == expected.encode("utf-8"),
                     f"The tested commit lacks the approved contents of {name}.")
-        with TemporaryDirectory(prefix="verify-", dir=self.scratch) as folder:
-            tree = Path(folder) / "checkout"
+        criteria = [row["id"] for row in draft["plan"]["criteria"]]
+        context = [f"Commit under test\n{candidate}", "Approved specification\n" + draft["files"]["spec.md"]]
+        if self.native:
+            # Keep the same checkout and identity while the parent chat waits for the verifier.
+            sequence = self.latest_report(candidate).get("attempt", 0) + 1 if latest.is_file() else 1
+            job_id = f"verify-{candidate}-{sequence}"
+            tree = self.directory / "worktrees" / job_id
             checkout(self.repo, tree, candidate)
-            try:
-                result = self.agent("verifier", tree, [
-                    f"Commit under test\n{candidate}", "Approved specification\n" + draft["files"]["spec.md"],
-                ], "verification")
-                require(head(tree) == candidate and not status(tree), "The verifier changed its checkout.")
-            finally:
-                # The checkout is private and disposable. Git removes its own metadata.
-                git(self.repo, "worktree", "remove", "--force", "--", str(tree))
+            result = self.agent("verifier", tree, context, "verification", job_id, criteria=criteria)
+            require(head(tree) == candidate and not status(tree), "The verifier changed its checkout.")
+        else:
+            with TemporaryDirectory(prefix="verify-", dir=self.scratch) as folder:
+                tree = Path(folder) / "checkout"
+                checkout(self.repo, tree, candidate)
+                try:
+                    result = self.agent("verifier", tree, context, "verification")
+                    require(head(tree) == candidate and not status(tree), "The verifier changed its checkout.")
+                finally:
+                    git(self.repo, "worktree", "remove", "--force", "--", str(tree))
         rows = result["criteria"]
-        expected_ids = [row["id"] for row in draft["plan"]["criteria"]]
-        require(sorted(row["id"] for row in rows) == sorted(expected_ids)
-                and all(text(row["check"]) and text(row["observed"]) for row in rows),
-                "Verification needs one observed result for each approved acceptance criterion.")
-        identifier = uuid.uuid4().hex
+        validate_verdict(rows, criteria)
+        identifier = job_id if self.native else uuid.uuid4().hex
         name = f"{prefix}/{identifier}.json"
         report = {"run_id": self.data["id"], "repo": str(self.repo), "commit": candidate,
                   "feature": self.data["feature"], "approved_digest": digest(draft), "criteria": rows, "file": name}
+        if self.native:
+            report["attempt"] = sequence
         self.save(name, report)
         self.save(f"{prefix}/latest.json", {"report": name})
         self.save("latest-verification.json", {"report": name})

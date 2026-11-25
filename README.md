@@ -20,35 +20,38 @@ claude plugin marketplace add /path/to/sdlc-plugin
 claude plugin install sdlc@sdlc-tools
 ```
 
-Use Git with an author identity, Python 3.9 or newer, and `uvx`. The plugin runs on macOS or Linux with the selected, authenticated host CLI and its sandbox support. The runner fetches the pinned Spec Kit 1.4.4 revision through `uvx` on first use. Spec Kit needs Python 3.11 or newer, which `uvx` selects separately. Publishing a GitHub PR also requires authenticated `gh` and permission to push to the selected remote.
+Use Git with an author identity and Python 3.9 or newer. For the chat workflow, use a Codex or Claude Code session with native subagents enabled. The host must allow access to the runner's state directory and the exact Git worktrees it creates. Publishing a GitHub PR also requires authenticated `gh` and permission to push to the selected remote.
 
-## Run a feature
+## Run a feature from your chat
 
-From an agent session in the application repo, invoke `$sdlc` in Codex or `/sdlc:sdlc` in Claude Code. Describe what you want to change.
+From an agent session in the application repo, invoke `$sdlc` in Codex or `/sdlc:sdlc` in Claude Code and describe the change. The skill starts one planner subagent in that session. Review the resulting `spec.md`, `plan.md`, and `tasks.md` before you approve implementation.
 
-The [entry skill](plugins/sdlc/skills/sdlc/SKILL.md) launches the same runner you can use from a terminal. Set `SDLC_RUNNER` to the absolute path to the installed skill's `scripts/run.py`, or to that script in the source checkout.
+After you approve, the chat launches named workers as native subagents. You can ask the parent chat to show their status or tell a worker to change course within its approved assignment. Tasks wait for their prerequisites. The runner checks file assignments, integrates the commits, and asks a fresh native verifier to test the combined result. Failed checks can go back to the owning workers for up to two repair rounds by default.
+
+The [entry skill](plugins/sdlc/skills/sdlc/SKILL.md) and [native dispatch instructions](plugins/sdlc/skills/sdlc/references/native-agents.md) define the chat's responsibilities. The runner records the actual agent IDs and checks each completed handoff. Host permissions govern access to the worktrees. The Git scope checks govern what can be integrated.
+
+| Command | Use |
+|---|---|
+| `status RUN_ID` | Show pending jobs, attached native IDs, and delivery status. |
+| `approve RUN_ID --digest DRAFT_DIGEST` | Approve the exact feature draft you reviewed. |
+| `reject RUN_ID` | End a pending review. |
+| `revise RUN_ID --request REQUEST` | Start a new review after stopping and detaching any outstanding agents. |
+| `resume RUN_ID` | Process native results or continue a paused or failed terminal run. |
+| `verify-commit RUN_ID --commit COMMIT` | Check a different exact commit containing the approved spec. In chat mode this creates a fresh verifier job. |
+
+Run state stays in `${XDG_STATE_HOME:-~/.local/state}/sdlc` by default. Set `SDLC_STATE_DIR` to use another location outside the app and its Git metadata. Review files are in a separate app worktree and are included on the verified branch. State also includes checks, task commits, and the pinned skill resources used to resume the run.
+
+## Terminal automation
+
+Set `SDLC_RUNNER` to the absolute path to the installed skill's `scripts/run.py`. The CLI backend runs outside an interactive chat using the authenticated host CLI and the pinned Spec Kit revision. It needs `uvx`, which selects Python 3.11 or newer for Spec Kit.
 
 ```sh
-python3 "$SDLC_RUNNER" start --host codex --feature json-output --request 'Add JSON output.'
+python3 "$SDLC_RUNNER" start --backend cli --host codex --feature json-output --request 'Add JSON output.'
 python3 "$SDLC_RUNNER" status RUN_ID
 python3 "$SDLC_RUNNER" approve RUN_ID --digest DRAFT_DIGEST
 ```
 
-The first command returns the review folder and draft digest. Review `spec.md`, `plan.md`, and `tasks.md` in that folder before approving. The folder is in a separate worktree of your app repo. The approved files are included on the verified branch, and your original checkout is left as it was. The runner cancels approval if the draft bytes or starting commit have changed.
-
-| Command | Use |
-|---|---|
-| `reject RUN_ID` | End a pending review. |
-| `revise RUN_ID --request REQUEST` | Start a new review with updated instructions or a new starting commit. |
-| `resume RUN_ID` | Continue a paused or failed Spec Kit run. |
-| `recover RUN_ID` | Start a replacement engine attempt after a startup failure or stale running state. Accepted worker commits are reused. |
-| `verify-commit RUN_ID --commit COMMIT` | Check a different exact commit containing the approved spec, such as the revision CI will ship. This writes new evidence and exits nonzero if any check fails or is blocked. |
-
-Tasks can name prerequisites. The runner executes independent tasks in batches of up to two workers and integrates each batch before starting its dependents. Each file has one owning task. A post-run Git diff check determines which changes may be integrated. The selected host's sandbox controls what its tools can access during execution.
-
-The verifier records the check and observed result for every acceptance ID. A failed check can trigger a repair in the owning tasks' approved files, followed by a fresh verification of the new commit. The default maximum is two repair rounds. Set `--max-fixes` when starting a run. An environment blocker pauses delivery until the check can run.
-
-Run state stays in `${XDG_STATE_HOME:-~/.local/state}/sdlc` by default. Set `SDLC_STATE_DIR` to use another location outside the app and its Git metadata. State includes the review worktree, worker commits, independent verification reports, and a pinned copy of the skill resources for recovery across upgrades.
+Use `recover RUN_ID` if Spec Kit could not start or left a stale running state. Confirm the draft and starting commit before approving either backend.
 
 ## PR and release handoff
 
@@ -72,4 +75,4 @@ For a failed smoke check, use `--result fail --follow-up 'Describe the follow-up
 - [Release handoff](plugins/sdlc/skills/sdlc/references/release.md)
 - [Spec Kit workflow](plugins/sdlc/skills/sdlc/scripts/workflow.yml)
 
-Run `python3 -m unittest discover -s tests -v` for workflow and Git integration tests in temporary repositories. These tests use simulated agent and Spec Kit CLIs to exercise approval, repair, recovery, scope enforcement, and evidence. A live smoke test also needs Spec Kit access, an authenticated host, and a separate Git app.
+Run `python3 -m unittest discover -s tests -v` for workflow and Git integration tests in temporary repositories. These tests exercise native job dispatch and handoffs, approval, repair, recovery, scope enforcement, and evidence in temporary Git repositories. The terminal integration tests use simulated agent and Spec Kit CLIs.

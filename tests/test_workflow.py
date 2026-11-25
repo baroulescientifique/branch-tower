@@ -13,6 +13,7 @@ RUNNER = REPO / "plugins/sdlc/skills/sdlc/scripts/run.py"
 sys.path.insert(0, str(RUNNER.parent))
 from pipeline import Run
 from handoff import publish
+from fake_cli import planner
 from unittest.mock import patch
 
 
@@ -74,6 +75,155 @@ class WorkflowTest(unittest.TestCase):
             (root / name).write_text("0\n")
         self.fixture.git("add", ".")
         self.fixture.git("commit", "-qm", "Fixture")
+
+    def native_start(self, host="codex"):
+        return self.fixture.invoke("start", "--backend", "native", "--host", host,
+                                   "--feature", "report", "--request", "Generate a report")
+
+    def native_attach(self, run_id, job_id, agent):
+        f = self.fixture
+        job = f.invoke("reserve-job", run_id, "--job", job_id)["job"]
+        bound = f.invoke("attach-agent", run_id, "--job", job_id, "--token", job["token"],
+                         "--agent-id", agent)["job"]
+        self.assertEqual(bound["agent_id"], agent)
+        return bound
+
+    def native_submit(self, data, job, result, expect=0):
+        f = self.fixture
+        path = f.directory(data) / "test-result.json"
+        path.write_text(json.dumps(result))
+        return f.invoke("submit-job", data["run_id"], "--job", job["id"], "--token", job["token"],
+                        "--agent-id", job["agent_id"], "--result-file", str(path), expect=expect)
+
+    def test_native_jobs_finish_and_repair_without_running_a_background_cli(self):
+        f = self.fixture
+        started = self.native_start(host="claude")
+        run_id = started["run_id"]
+        self.assertEqual(started["status"], "waiting_for_agents")
+        self.assertEqual([job["id"] for job in started["jobs"]], ["planner"])
+        self.assertFalse((f.directory(started) / "engine").exists())
+
+        plan_job = self.native_attach(run_id, "planner", "native-planner")
+        self.native_submit(started, plan_job, planner())
+        review = f.invoke("resume", run_id)
+        self.assertEqual(review["status"], "paused")
+        self.assertEqual(review["jobs"], [])
+        self.assertFalse(f.git("branch", "--list", "sdlc/*"))
+        ready = f.approve(review)
+        self.assertEqual([job["id"] for job in ready["jobs"]], ["initial-1-T01", "initial-1-T02"])
+        first = self.native_attach(run_id, "initial-1-T01", "native-a")
+        second = self.native_attach(run_id, "initial-1-T02", "native-b")
+        poll = f.invoke("resume", run_id)
+        self.assertEqual([job["agent_id"] for job in poll["jobs"]], ["native-a", "native-b"])
+        checks = {"summary": "Implemented", "checks": ["Read the output."]}
+        (Path(first["checkout"]) / "a.txt").write_text("2\n")
+        (Path(second["checkout"]) / "b.txt").write_text("3\n")
+        self.native_submit(started, first, checks)
+        self.native_submit(started, first, checks)
+        self.assertEqual([job["id"] for job in f.invoke("resume", run_id)["jobs"]], [second["id"]])
+        self.native_submit(started, second, checks)
+
+        job = f.invoke("resume", run_id)["jobs"][0]
+        self.assertEqual(job["id"], "initial-2-T03")
+        combine = self.native_attach(run_id, job["id"], "native-combine")
+        worktree = Path(combine["checkout"])
+        self.assertEqual((worktree / "a.txt").read_text(), "2\n")
+        self.assertEqual((worktree / "b.txt").read_text(), "3\n")
+        (worktree / "report[1].txt").write_text("4\n")
+        self.native_submit(started, combine, checks)
+
+        job = f.invoke("resume", run_id)["jobs"][0]
+        verification = self.native_attach(run_id, job["id"], "native-verify-first")
+        self.assertEqual(f.invoke("resume", run_id)["jobs"][0]["agent_id"], "native-verify-first")
+        criteria = [{"id": "AC-01", "check": "Sum a and b", "observed": "5", "status": "pass"},
+                    {"id": "AC-02", "check": "Read report", "observed": "4", "status": "fail"}]
+        self.native_submit(started, verification, {"criteria": criteria})
+        repair = f.invoke("resume", run_id)["jobs"][0]
+        self.assertEqual(repair["id"], "repair-1-T03")
+        self.assertIn("Verifier feedback", Path(repair["prompt_file"]).read_text())
+        repair = self.native_attach(run_id, repair["id"], "native-repair")
+        (Path(repair["checkout"]) / "report[1].txt").write_text("5\n")
+        self.native_submit(started, repair, checks)
+        job = f.invoke("resume", run_id)["jobs"][0]
+        self.assertNotEqual(job["commit"], verification["commit"])
+        verification = self.native_attach(run_id, job["id"], "native-verify-after-repair")
+        criteria[1].update(status="pass", observed="5")
+        self.native_submit(started, verification, {"criteria": criteria})
+        finished = f.invoke("resume", run_id)
+        self.assertEqual(finished["status"], "completed")
+        self.assertEqual(f.git("show", f"{finished['commit']}:report[1].txt"), "5")
+        self.assertEqual(f.git("status", "--porcelain"), "")
+        self.assertFalse((f.directory(started) / "engine").exists())
+
+        f.git("checkout", "-q", finished["branch"])
+        f.git("commit", "--allow-empty", "-qm", "Different merge candidate")
+        merge_commit = f.git("rev-parse", "HEAD")
+        scheduled = f.invoke("verify-commit", run_id, "--commit", merge_commit)["jobs"][0]
+        self.assertEqual(scheduled["commit"], merge_commit)
+        separate = self.native_attach(run_id, scheduled["id"], "native-ci-verify")
+        self.native_submit(started, separate, {"criteria": criteria})
+        checked = f.invoke("resume", run_id)
+        self.assertEqual(checked["commit"], merge_commit)
+        self.assertEqual(json.loads(Path(checked["evidence"]).read_text())["commit"], merge_commit)
+
+    def test_native_reservation_rejects_duplicate_dispatch_and_stale_results(self):
+        f = self.fixture
+        started = self.native_start()
+        run_id = started["run_id"]
+        old = self.native_attach(run_id, "planner", "old-id")
+        self.assertIn("already reserved",
+                      f.invoke("reserve-job", run_id, "--job", "planner", expect=1))
+        self.assertIn("Stop and detach",
+                      f.invoke("revise", run_id, "--request", "New request", expect=1))
+        f.invoke("detach-agent", run_id, "--job", old["id"], "--token", old["token"])
+        new = self.native_attach(run_id, "planner", "replacement-id")
+        self.assertNotEqual(old["token"], new["token"])
+        self.assertIn("currently attached", self.native_submit(started, old, planner(), expect=1))
+        self.native_submit(started, new, planner())
+
+    def test_native_worker_receipt_rejects_unapproved_paths_and_later_edits(self):
+        f = self.fixture
+        started = self.native_start()
+        run_id = started["run_id"]
+        job = self.native_attach(run_id, "planner", "plan")
+        self.native_submit(started, job, planner())
+        f.approve(f.invoke("resume", run_id))
+        first = self.native_attach(run_id, "initial-1-T01", "worker")
+        tree = Path(first["checkout"])
+        extra = tree / "outside.txt"
+        extra.write_text("unauthorized")
+        (tree / "a.txt").write_text("2\n")
+        result = {"summary": "Work", "checks": ["Read a."]}
+        self.assertIn("unapproved paths", self.native_submit(started, first, result, expect=1))
+        extra.unlink()
+        self.native_submit(started, first, result)
+        (tree / "a.txt").write_text("3\n")
+        failed = f.invoke("resume", run_id, expect=1)
+        self.assertIn("changed after its agent submitted", failed["detail"])
+        self.assertFalse(f.git("branch", "--list", "sdlc/*"))
+        second = self.native_attach(run_id, "initial-1-T02", "independent-worker")
+        (Path(second["checkout"]) / "b.txt").write_text("3\n")
+        submitted = self.native_submit(started, second, result)
+        self.assertEqual(submitted["job"]["status"], "submitted")
+        self.assertEqual(submitted["status"], "failed")
+
+    def test_native_worker_commit_without_submitted_result_cannot_be_recovered(self):
+        f = self.fixture
+        started = self.native_start()
+        run_id = started["run_id"]
+        planner_job = self.native_attach(run_id, "planner", "plan")
+        self.native_submit(started, planner_job, planner())
+        f.approve(f.invoke("resume", run_id))
+        job = self.native_attach(run_id, "initial-1-T01", "premature-worker")
+        tree = Path(job["checkout"])
+        (tree / "a.txt").write_text("2\n")
+        subprocess.run(["git", "add", "a.txt"], cwd=tree, check=True)
+        subprocess.run(["git", "commit", "-qm", f"SDLC {run_id} {job['id']}", "-m",
+                        json.dumps({"summary": "Predates submission", "checks": ["Read a.txt"]})],
+                       cwd=tree, check=True)
+        failed = f.invoke("resume", run_id, expect=1)
+        self.assertIn("committed without an accepted native result", failed["detail"])
+        self.assertFalse(f.git("branch", "--list", "sdlc/*"))
 
     def test_codex_approval_parallel_dependencies_verification_and_release(self):
         f = self.fixture

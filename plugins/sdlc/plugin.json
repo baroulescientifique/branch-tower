@@ -1,6 +1,6 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "sdlc",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Plan, approve, implement, and independently verify changes in a Git repository."
 }
